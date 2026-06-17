@@ -39,6 +39,12 @@ const SENSITIVE_KEYS = new Set<string>([
   "sessiontoken",
   "private_key",
   "privatekey",
+  // Plaintext secret material carried in secrets create/rotate request bodies.
+  // Without these, a failed POST /companies/:id/secrets logs the raw value.
+  "value",
+  "secretvalue",
+  "secret_value",
+  "plaintext",
 ]);
 
 const MAX_DEPTH = 6;

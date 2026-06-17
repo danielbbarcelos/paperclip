@@ -1009,10 +1009,18 @@ export async function buildSshSpawnTarget(input: {
       : `exec ${remoteCommandParts}`,
   ].join(" && ");
 
+  // A username/host beginning with "-" could be parsed by ssh as an option
+  // (e.g. -oProxyCommand=...), turning the destination into command execution.
+  const sshDestination = `${input.spec.username}@${input.spec.host}`;
+  if (input.spec.username.startsWith("-") || input.spec.host.startsWith("-")) {
+    throw new Error(`Refusing to connect to unsafe ssh destination "${sshDestination}".`);
+  }
   sshArgs.push(
     "-p",
     String(input.spec.port),
-    `${input.spec.username}@${input.spec.host}`,
+    // "--" stops option parsing so the destination can never be treated as a flag.
+    "--",
+    sshDestination,
     `sh -c ${shellQuote(remoteScript)}`,
   );
 

@@ -262,7 +262,10 @@ export function adapterRoutes() {
 
         logger.info({ spec, pluginsDir }, "Installing adapter package via npm");
 
-        await execFileAsync("npm", ["install", "--no-save", spec], {
+        // --ignore-scripts prevents preinstall/install/postinstall hooks from
+        // executing arbitrary code on the host during install (mirrors the
+        // plugin loader's hardening in services/plugin-loader.ts).
+        await execFileAsync("npm", ["install", "--no-save", "--ignore-scripts", spec], {
           cwd: pluginsDir,
           timeout: 120_000,
         });
@@ -476,7 +479,7 @@ export function adapterRoutes() {
     if (externalRecord.packageName && !externalRecord.localPath) {
       try {
         const pluginsDir = getAdapterPluginsDir();
-        await execFileAsync("npm", ["uninstall", externalRecord.packageName], {
+        await execFileAsync("npm", ["uninstall", "--ignore-scripts", externalRecord.packageName], {
           cwd: pluginsDir,
           timeout: 60_000,
         });
@@ -589,7 +592,7 @@ export function adapterRoutes() {
 
       logger.info({ type, packageName: record.packageName }, "Reinstalling adapter package via npm");
 
-      await execFileAsync("npm", ["install", "--no-save", record.packageName], {
+      await execFileAsync("npm", ["install", "--no-save", "--ignore-scripts", record.packageName], {
         cwd: pluginsDir,
         timeout: 120_000,
       });

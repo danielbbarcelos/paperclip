@@ -917,8 +917,19 @@ async function ensureManagedProjectWorkspace(input: {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 
+  // Harden against git argument/transport injection: a repoUrl beginning with
+  // "-" could be parsed as an option (e.g. --upload-pack=...), and remote
+  // helper transports like "ext::" / "fd::" execute arbitrary commands.
+  if (input.repoUrl.startsWith("-")) {
+    throw new Error(`Refusing to clone repository with unsafe URL "${input.repoUrl}".`);
+  }
+  if (/^(ext|fd)::/i.test(input.repoUrl)) {
+    throw new Error(`Refusing to clone repository with unsafe transport "${input.repoUrl}".`);
+  }
+
   try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
+    // "--" stops option parsing so repoUrl can never be treated as a flag.
+    await execFile("git", ["clone", "--", input.repoUrl, cwd], {
       env: sanitizeRuntimeServiceBaseEnv(process.env),
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });

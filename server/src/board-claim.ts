@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
@@ -32,10 +32,17 @@ function createChallenge(now = new Date()): ClaimChallenge {
   };
 }
 
+function constantTimeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 function getChallengeStatus(token: string, code: string | undefined): ChallengeStatus {
   if (!activeChallenge) return "invalid";
-  if (activeChallenge.token !== token) return "invalid";
-  if (activeChallenge.code !== (code ?? "")) return "invalid";
+  if (!constantTimeEqual(activeChallenge.token, token)) return "invalid";
+  if (!constantTimeEqual(activeChallenge.code, code ?? "")) return "invalid";
   if (activeChallenge.claimedAt) return "claimed";
   if (activeChallenge.expiresAt.getTime() <= Date.now()) return "expired";
   return "available";

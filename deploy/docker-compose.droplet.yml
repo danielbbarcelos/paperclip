@@ -1,0 +1,49 @@
+# Compose standalone para rodar a imagem PRÉ-BUILDADA (ghcr) num droplet.
+# Não precisa do código-fonte no servidor — só este arquivo + um .env ao lado.
+# Veja deploy/DROPLET.md.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-paperclip}"
+      # Sem default fraco: recusa subir sem senha forte.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (ex.: openssl rand -base64 32)}"
+      POSTGRES_DB: "${POSTGRES_DB:-paperclip}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-paperclip} -d ${POSTGRES_DB:-paperclip}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # Postgres só é acessível pela rede interna do compose (host "db").
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  server:
+    image: "${PAPERCLIP_IMAGE:-ghcr.io/danielbbarcelos/paperclip:latest}"
+    ports:
+      - "3100:3100"
+    # Injeta todo o .env (segredos + hardening: backups cifrados, soft-delete,
+    # plugin allowlist, TRUST_PROXY em público, etc.).
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-paperclip}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-paperclip}"
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}"
+      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # Banco novo na 1ª subida: aplica migrations automaticamente.
+      PAPERCLIP_MIGRATION_AUTO_APPLY: "${PAPERCLIP_MIGRATION_AUTO_APPLY:-true}"
+    volumes:
+      - paperclip-data:/paperclip
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  paperclip-data:

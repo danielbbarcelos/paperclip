@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -217,6 +217,16 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
   const companyName = paperclipCompanyId || `${stackId} Paperclip`;
   const now = new Date();
 
+  // Optional per-request HMAC signature over the identity headers. The shared
+  // tenant token alone lets any holder forge an arbitrary userId/stackId/role
+  // (cross-tenant impersonation). When PAPERCLIP_CLOUD_TENANT_HMAC_KEY is set,
+  // the upstream proxy must additionally sign userId:stackId:role:timestamp, so
+  // a leaked token cannot mint identities without the signing key. Opt-in with
+  // fallback so the external proxy can be upgraded independently.
+  if (verifyCloudTenantSignature(req, { userId, stackId, stackRole }) === "invalid") {
+    return null;
+  }
+
   await db
     .insert(authUsers)
     .values({
@@ -315,6 +325,61 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
     isInstanceAdmin: false,
     source: "cloud_tenant",
   };
+}
+
+const CLOUD_TENANT_SIGNATURE_MAX_SKEW_SECONDS = 300;
+
+/**
+ * Verify the optional HMAC signature binding the trusted Cloud tenant identity
+ * headers to the signing key, defeating cross-tenant impersonation via a leaked
+ * shared tenant token.
+ *
+ * Returns:
+ *  - "skip"    — no signing key configured, or no signature present while the
+ *                signature is not required (backward-compatible migration mode).
+ *  - "valid"   — signature present and verified within the freshness window.
+ *  - "invalid" — signature present but wrong/expired, or required-but-missing.
+ *
+ * Signed payload: `${userId}:${stackId}:${stackRole}:${timestamp}` where
+ * timestamp is unix seconds, carried in x-paperclip-cloud-timestamp, and the
+ * base64url HMAC-SHA256 is carried in x-paperclip-cloud-signature.
+ */
+export function verifyCloudTenantSignature(
+  req: Request,
+  identity: { userId: string; stackId: string; stackRole: string },
+): "skip" | "valid" | "invalid" {
+  const key = process.env.PAPERCLIP_CLOUD_TENANT_HMAC_KEY?.trim();
+  if (!key) return "skip";
+
+  const required = parseBooleanEnvValue(process.env.PAPERCLIP_CLOUD_TENANT_HMAC_REQUIRED);
+  const signature = req.header("x-paperclip-cloud-signature")?.trim();
+  const timestamp = req.header("x-paperclip-cloud-timestamp")?.trim();
+
+  if (!signature || !timestamp) {
+    if (required) {
+      logger.warn({ stackId: identity.stackId }, "cloud tenant request missing required HMAC signature");
+      return "invalid";
+    }
+    return "skip";
+  }
+
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) return "invalid";
+  const skew = Math.abs(Math.floor(Date.now() / 1000) - ts);
+  if (skew > CLOUD_TENANT_SIGNATURE_MAX_SKEW_SECONDS) {
+    logger.warn({ stackId: identity.stackId, skew }, "cloud tenant HMAC signature outside freshness window");
+    return "invalid";
+  }
+
+  const payload = `${identity.userId}:${identity.stackId}:${identity.stackRole}:${timestamp}`;
+  const expected = createHmac("sha256", key).update(payload).digest("base64url");
+  return constantTimeStringEqual(signature, expected) ? "valid" : "invalid";
+}
+
+function parseBooleanEnvValue(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
 function requiredCloudHeader(req: Request, name: string): string {

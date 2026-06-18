@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
-import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
+import { boardMutationGuard, buildTrustedBoardOrigins } from "../middleware/board-mutation-guard.js";
+
+// Config-derived trusted origins (includes the built-in dev origins such as
+// http://localhost:3100). The guard no longer trusts request Host headers.
+const TEST_TRUSTED_ORIGINS = buildTrustedBoardOrigins({
+  allowedHostnames: [],
+  port: 3100,
+  deploymentMode: "local_trusted",
+});
 
 function createApp(
   actorType: "board" | "agent",
@@ -15,7 +23,7 @@ function createApp(
       : { type: "agent", agentId: "agent-1" };
     next();
   });
-  app.use(boardMutationGuard());
+  app.use(boardMutationGuard({ trustedOrigins: TEST_TRUSTED_ORIGINS }));
   app.post("/mutate", (_req, res) => {
     res.status(204).end();
   });
@@ -33,7 +41,7 @@ describe("boardMutationGuard", () => {
   });
 
   it("blocks board mutations without trusted origin", () => {
-    const middleware = boardMutationGuard();
+    const middleware = boardMutationGuard({ trustedOrigins: TEST_TRUSTED_ORIGINS });
     const req = {
       method: "POST",
       actor: { type: "board", userId: "board", source: "session" },
@@ -90,7 +98,10 @@ describe("boardMutationGuard", () => {
     expect([200, 204]).toContain(res.status);
   });
 
-  it("allows board mutations when x-forwarded-host matches origin", async () => {
+  it("blocks board mutations from a spoofable x-forwarded-host origin (CSRF fix)", async () => {
+    // The forwarded host is NOT in the server-configured trusted origins, so an
+    // Origin matching only the (attacker-controllable) X-Forwarded-Host header
+    // must be rejected — this is the CSRF hardening.
     const app = createApp("board");
     const res = await request(app)
       .post("/mutate")
@@ -98,11 +109,32 @@ describe("boardMutationGuard", () => {
       .set("X-Forwarded-Host", "10.90.10.20:3443")
       .set("Origin", "https://10.90.10.20:3443")
       .send({ ok: true });
+    expect(res.status).toBe(403);
+  });
+
+  it("allows board mutations from a configured allowed-host origin", async () => {
+    const trustedOrigins = buildTrustedBoardOrigins({
+      allowedHostnames: ["board.example.com"],
+      port: 443,
+      deploymentMode: "authenticated",
+    });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId: "board", source: "session" };
+      next();
+    });
+    app.use(boardMutationGuard({ trustedOrigins }));
+    app.post("/mutate", (_req, res) => res.status(204).end());
+    const res = await request(app)
+      .post("/mutate")
+      .set("Origin", "https://board.example.com")
+      .send({ ok: true });
     expect([200, 204]).toContain(res.status);
   });
 
   it("blocks board mutations when x-forwarded-host does not match origin", async () => {
-    const middleware = boardMutationGuard();
+    const middleware = boardMutationGuard({ trustedOrigins: TEST_TRUSTED_ORIGINS });
     const req = {
       method: "POST",
       actor: { type: "board", userId: "board", source: "session" },
@@ -129,7 +161,7 @@ describe("boardMutationGuard", () => {
   });
 
   it("does not block authenticated agent mutations", async () => {
-    const middleware = boardMutationGuard();
+    const middleware = boardMutationGuard({ trustedOrigins: TEST_TRUSTED_ORIGINS });
     const req = {
       method: "POST",
       actor: { type: "agent", agentId: "agent-1" },

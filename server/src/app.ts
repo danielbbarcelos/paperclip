@@ -7,7 +7,9 @@ import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
-import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { boardMutationGuard, buildTrustedBoardOrigins } from "./middleware/board-mutation-guard.js";
+import { rateLimitMiddleware } from "./middleware/rate-limit.js";
+import { requireAuthGate } from "./middleware/require-auth-gate.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
 import { healthRoutes } from "./routes/health.js";
@@ -196,6 +198,32 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  // Brute-force throttle for bearer-token auth: count only requests that
+  // presented an Authorization header but failed to resolve to any principal
+  // (actor.type === "none"), keyed by client IP. Legitimate authenticated
+  // traffic is never counted. Keys off req.ip (honors TRUST_PROXY above).
+  app.use(
+    rateLimitMiddleware({
+      windowMs: 60_000,
+      maxRequests: 30,
+      message: "Too many failed authentication attempts",
+      keyFn: (req) =>
+        req.actor?.type === "none" && req.headers.authorization
+          ? `badauth:${req.ip ?? "unknown"}`
+          : null,
+    }),
+  );
+  // Throttle password/credential auth (sign-in, sign-up, reset) to slow online
+  // brute force. Only POSTs are counted so GET /get-session polling is unaffected.
+  app.use(
+    "/api/auth",
+    rateLimitMiddleware({
+      windowMs: 5 * 60_000,
+      maxRequests: 30,
+      message: "Too many authentication attempts",
+      keyFn: (req) => (req.method === "POST" ? `auth:${req.ip ?? "unknown"}` : null),
+    }),
+  );
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -207,7 +235,18 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
-  api.use(boardMutationGuard());
+  api.use(
+    boardMutationGuard({
+      trustedOrigins: buildTrustedBoardOrigins({
+        allowedHostnames: opts.allowedHostnames,
+        port: opts.serverPort,
+        deploymentMode: opts.deploymentMode,
+      }),
+    }),
+  );
+  // Fail-closed: reject unauthenticated callers except on explicitly public
+  // endpoints, so a route handler that forgets to assert auth cannot leak.
+  api.use(requireAuthGate());
   api.use(
     "/health",
     healthRoutes(db, {

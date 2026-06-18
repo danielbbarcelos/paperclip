@@ -90,7 +90,11 @@ export function boardMutationGuard(options: { trustedOrigins: Set<string> }): Re
     }
 
     if (!isTrustedBoardMutationRequest(req, allowedOrigins)) {
-      res.status(403).json({ error: "Board mutation requires trusted browser origin" });
+      res.status(403).json({
+        error:
+          "Board mutation requires a trusted browser origin. Ensure the request "
+          + "Origin matches PAPERCLIP_PUBLIC_URL or PAPERCLIP_ALLOWED_HOSTNAMES.",
+      });
       return;
     }
 

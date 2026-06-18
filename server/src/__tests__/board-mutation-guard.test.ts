@@ -57,9 +57,11 @@ describe("boardMutationGuard", () => {
 
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({
-      error: "Board mutation requires trusted browser origin",
-    });
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.stringContaining("trusted browser origin"),
+      }),
+    );
   });
 
   it("allows local implicit board mutations without origin", async () => {
@@ -155,9 +157,11 @@ describe("boardMutationGuard", () => {
 
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({
-      error: "Board mutation requires trusted browser origin",
-    });
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.stringContaining("trusted browser origin"),
+      }),
+    );
   });
 
   it("does not block authenticated agent mutations", async () => {

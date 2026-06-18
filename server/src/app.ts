@@ -92,6 +92,13 @@ const VITE_DEV_STATIC_PATHS = new Set([
   "/sw.js",
 ]);
 
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 export function isDatabaseConnectionUnavailableError(err: unknown): boolean {
   const error = err as { code?: unknown; message?: unknown; cause?: unknown };
   if (error?.code === "ECONNREFUSED") return true;
@@ -201,11 +208,16 @@ export async function createApp(
   // Brute-force throttle for bearer-token auth: count only requests that
   // presented an Authorization header but failed to resolve to any principal
   // (actor.type === "none"), keyed by client IP. Legitimate authenticated
-  // traffic is never counted. Keys off req.ip (honors TRUST_PROXY above).
+  // traffic is never counted.
+  //
+  // IMPORTANT: req.ip honors TRUST_PROXY (above). Behind a reverse proxy with
+  // TRUST_PROXY unset, req.ip is the proxy's IP, so ALL clients share one
+  // bucket — set TRUST_PROXY so the limit is per real client. Limits are
+  // generous and env-tunable to avoid locking out a team behind a shared IP.
   app.use(
     rateLimitMiddleware({
-      windowMs: 60_000,
-      maxRequests: 30,
+      windowMs: envPositiveInt("PAPERCLIP_FAILED_AUTH_RATELIMIT_WINDOW_MS", 60_000),
+      maxRequests: envPositiveInt("PAPERCLIP_FAILED_AUTH_RATELIMIT_MAX", 60),
       message: "Too many failed authentication attempts",
       keyFn: (req) =>
         req.actor?.type === "none" && req.headers.authorization
@@ -215,11 +227,13 @@ export async function createApp(
   );
   // Throttle password/credential auth (sign-in, sign-up, reset) to slow online
   // brute force. Only POSTs are counted so GET /get-session polling is unaffected.
+  // Default 50 per 15min per client IP — high enough not to block a team behind
+  // one NAT/proxy IP, far below a real brute-force rate. Tune via env if needed.
   app.use(
     "/api/auth",
     rateLimitMiddleware({
-      windowMs: 5 * 60_000,
-      maxRequests: 30,
+      windowMs: envPositiveInt("PAPERCLIP_AUTH_RATELIMIT_WINDOW_MS", 15 * 60_000),
+      maxRequests: envPositiveInt("PAPERCLIP_AUTH_RATELIMIT_MAX", 50),
       message: "Too many authentication attempts",
       keyFn: (req) => (req.method === "POST" ? `auth:${req.ip ?? "unknown"}` : null),
     }),

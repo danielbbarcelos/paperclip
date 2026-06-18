@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, Github, WrapText } from "lucide-react";
 import Markdown, { defaultUrlTransform, type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import DOMPurify from "dompurify";
 import { cn } from "../lib/utils";
 import { Link } from "@/lib/router";
 import { useTheme } from "../context/ThemeContext";
@@ -526,10 +527,22 @@ function MermaidDiagramBlock({ source, darkMode }: { source: string; darkMode: b
           theme: darkMode ? "dark" : "default",
           fontFamily: "inherit",
           suppressErrorRendering: true,
+          // Render labels as native SVG <text> instead of HTML inside
+          // <foreignObject>. This lets the DOMPurify pass below fully sanitize
+          // the output without having to allow foreignObject (an mXSS-bypass
+          // surface) to keep labels visible.
+          flowchart: { htmlLabels: false },
         });
         const rendered = await mermaid.render(`paperclip-mermaid-${renderId}`, source);
         if (!active) return;
-        setSvg(rendered.svg);
+        // Defense-in-depth: even with mermaid's securityLevel:"strict", sanitize
+        // the generated SVG before injecting it via dangerouslySetInnerHTML so a
+        // mermaid sanitizer-bypass cannot land agent-authored script in the
+        // human's authenticated session (stored XSS). Default DOMPurify keeps
+        // SVG + the HTML inside mermaid's <foreignObject> labels while stripping
+        // <script>, on* event handlers and javascript: URLs.
+        const safeSvg = DOMPurify.sanitize(rendered.svg);
+        setSvg(safeSvg);
       })
       .catch((err) => {
         if (!active) return;

@@ -8,6 +8,7 @@ import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { rateLimitMiddleware } from "./middleware/rate-limit.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
 import { healthRoutes } from "./routes/health.js";
@@ -194,6 +195,32 @@ export async function createApp(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,
       resolveSession: opts.resolveSession,
+    }),
+  );
+  // Brute-force throttle for bearer-token auth: count only requests that
+  // presented an Authorization header but failed to resolve to any principal
+  // (actor.type === "none"), keyed by client IP. Legitimate authenticated
+  // traffic is never counted. Keys off req.ip (honors TRUST_PROXY above).
+  app.use(
+    rateLimitMiddleware({
+      windowMs: 60_000,
+      maxRequests: 30,
+      message: "Too many failed authentication attempts",
+      keyFn: (req) =>
+        req.actor?.type === "none" && req.headers.authorization
+          ? `badauth:${req.ip ?? "unknown"}`
+          : null,
+    }),
+  );
+  // Throttle password/credential auth (sign-in, sign-up, reset) to slow online
+  // brute force. Only POSTs are counted so GET /get-session polling is unaffected.
+  app.use(
+    "/api/auth",
+    rateLimitMiddleware({
+      windowMs: 5 * 60_000,
+      maxRequests: 30,
+      message: "Too many authentication attempts",
+      keyFn: (req) => (req.method === "POST" ? `auth:${req.ip ?? "unknown"}` : null),
     }),
   );
   app.use("/api/auth", authRoutes(db));

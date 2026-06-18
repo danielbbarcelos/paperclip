@@ -34,6 +34,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
+import { rateLimitMiddleware } from "../middleware/rate-limit.js";
 import {
   agentService,
   agentInstructionsService,
@@ -173,6 +174,13 @@ export function agentRoutes(
   const router = Router();
   const svc = agentService(db);
   const access = accessService(db);
+  // Throttle the CPU-heavy org-chart render (SVG/PNG via sharp) per actor.
+  const orgRenderLimiter = rateLimitMiddleware({
+    windowMs: 60_000,
+    maxRequests: 30,
+    message: "Too many org chart render requests",
+    keyFn: (req) => `orgrender:${req.actor?.userId ?? req.actor?.agentId ?? req.ip ?? "unknown"}`,
+  });
   const approvalsSvc = approvalService(db);
   const budgets = budgetService(db);
   const environmentsSvc = environmentService(db);
@@ -1857,7 +1865,7 @@ export function agentRoutes(
     res.json(leanTree);
   });
 
-  router.get("/companies/:companyId/org.svg", async (req, res) => {
+  router.get("/companies/:companyId/org.svg", orgRenderLimiter, async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const style = (ORG_CHART_STYLES.includes(req.query.style as OrgChartStyle) ? req.query.style : "warmth") as OrgChartStyle;
@@ -1871,7 +1879,7 @@ export function agentRoutes(
     res.send(svg);
   });
 
-  router.get("/companies/:companyId/org.png", async (req, res) => {
+  router.get("/companies/:companyId/org.png", orgRenderLimiter, async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const style = (ORG_CHART_STYLES.includes(req.query.style as OrgChartStyle) ? req.query.style : "warmth") as OrgChartStyle;

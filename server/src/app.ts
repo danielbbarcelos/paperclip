@@ -9,6 +9,7 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard, buildTrustedBoardOrigins } from "./middleware/board-mutation-guard.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
+import { requireAuthGate } from "./middleware/require-auth-gate.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
 import { healthRoutes } from "./routes/health.js";
@@ -243,6 +244,9 @@ export async function createApp(
       }),
     }),
   );
+  // Fail-closed: reject unauthenticated callers except on explicitly public
+  // endpoints, so a route handler that forgets to assert auth cannot leak.
+  api.use(requireAuthGate());
   api.use(
     "/health",
     healthRoutes(db, {

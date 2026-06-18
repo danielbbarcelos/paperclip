@@ -1,4 +1,5 @@
 import { readConfigFile } from "./config-file.js";
+import { decodeBackupKey } from "@paperclipai/db";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
@@ -69,6 +70,10 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  /** When set, database backups are encrypted at rest with this 32-byte key. */
+  databaseBackupEncryptionKey?: Buffer;
+  /** Grace window (days) before soft-deleted companies/issues are purged. */
+  softDeleteGraceDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -265,6 +270,28 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  // Encrypt backups at rest when PAPERCLIP_DB_BACKUP_ENCRYPTED=true. The key must
+  // live outside the backup volume (env-injected) so a compromise of the backup
+  // directory does not also leak the plaintext database. Fail fast on misconfig.
+  const databaseBackupEncryptionEnabled = process.env.PAPERCLIP_DB_BACKUP_ENCRYPTED === "true";
+  let databaseBackupEncryptionKey: Buffer | undefined;
+  if (databaseBackupEncryptionEnabled) {
+    const key = decodeBackupKey(process.env.PAPERCLIP_DB_BACKUP_KEY);
+    if (!key) {
+      throw new Error(
+        "PAPERCLIP_DB_BACKUP_ENCRYPTED=true requires a valid PAPERCLIP_DB_BACKUP_KEY " +
+          "(32-byte key as base64, 64-char hex, or raw 32-char string). Generate one with " +
+          "`openssl rand -base64 32` and store it outside the backup volume.",
+      );
+    }
+    databaseBackupEncryptionKey = key;
+  }
+  // Soft-deleted companies/issues stay recoverable for this many days before the
+  // purge job runs the irreversible cascade. Minimum 1 day.
+  const softDeleteGraceDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_SOFT_DELETE_GRACE_DAYS) || 30,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -307,6 +334,8 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    databaseBackupEncryptionKey,
+    softDeleteGraceDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

@@ -78,6 +78,35 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
         repairHint: "Run `paperclipai configure --section server` and provide a valid URL",
       };
     }
+
+    // Behind a reverse proxy, req.ip (and per-client rate limiting / auth
+    // throttles) is only correct when TRUST_PROXY is set. The server refuses to
+    // boot a public deployment that leaves it unset; surface that here as a
+    // pre-flight. An explicit 0/false (direct, no-proxy exposure) is allowed.
+    const trustProxy = process.env.TRUST_PROXY?.trim();
+    if (trustProxy === undefined || trustProxy === "") {
+      return {
+        name: "Deployment/auth mode",
+        status: "fail",
+        message: "authenticated/public requires an explicit TRUST_PROXY (hop count / trusted subnet when proxied, or 0 for direct exposure) so per-client rate limiting is correct",
+        canRepair: false,
+        repairHint: "Set TRUST_PROXY to your reverse proxy's hop count (e.g. 1) or subnet(s), or 0 if exposed directly",
+      };
+    }
+
+    // Cloud tenant trust-header auth via a shared token is a cross-tenant
+    // impersonation primitive over the open internet unless the upstream proxy
+    // also signs the identity headers. The server requires the HMAC key in this
+    // case; flag it before start.
+    if (process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim() && !process.env.PAPERCLIP_CLOUD_TENANT_HMAC_KEY?.trim()) {
+      return {
+        name: "Deployment/auth mode",
+        status: "fail",
+        message: "PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN under public exposure also requires PAPERCLIP_CLOUD_TENANT_HMAC_KEY to prevent cross-tenant impersonation",
+        canRepair: false,
+        repairHint: "Set PAPERCLIP_CLOUD_TENANT_HMAC_KEY and have the upstream proxy sign tenant identity headers",
+      };
+    }
   }
 
   return {

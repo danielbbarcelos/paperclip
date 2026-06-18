@@ -202,6 +202,7 @@ export async function createApp(
   app.use(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,
+      deploymentExposure: opts.deploymentExposure,
       resolveSession: opts.resolveSession,
     }),
   );

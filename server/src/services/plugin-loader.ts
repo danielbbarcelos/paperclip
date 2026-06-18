@@ -112,7 +112,27 @@ const K8S_IN_CLUSTER_ENV_PASSTHROUGH = [
   "KUBERNETES_SERVICE_PORT_HTTPS",
 ];
 
+const ENV_CREDENTIAL_LOGGER = logger.child({ service: "plugin-credential-gate" });
+
+/**
+ * Parse the operator allowlist of plugin ids permitted to receive provider
+ * credentials. Returns `null` when the env var is unset (legacy mode: any
+ * environment-driver plugin gets credentials) or a Set when configured (strict
+ * mode: only listed ids do; an empty value denies all).
+ */
+function parseCredentialAllowlist(processEnv: NodeJS.ProcessEnv): Set<string> | null {
+  const raw = processEnv.PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST;
+  if (raw === undefined) return null;
+  return new Set(
+    raw
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+}
+
 export function buildPluginWorkerEnv(input: {
+  pluginId: string;
   manifest: Pick<PaperclipPluginManifestV1, "capabilities">;
   instanceInfo: { deploymentMode?: string | null; deploymentExposure?: string | null };
   processEnv?: NodeJS.ProcessEnv;
@@ -126,10 +146,40 @@ export function buildPluginWorkerEnv(input: {
     && input.manifest.capabilities.includes("environment.drivers.register");
   if (!canRegisterEnvironmentDrivers) return env;
 
+  // Approval gate: the `environment.drivers.register` capability alone is not
+  // enough to receive raw provider API keys — those keys are injected in
+  // plaintext into the plugin's process env, so a malicious/auto-approved plugin
+  // could exfiltrate them. Require the operator to explicitly allowlist the
+  // plugin id via PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST. Unset = legacy behavior
+  // (inject, but warn) so existing installs keep working across the upgrade.
+  const allowlist = parseCredentialAllowlist(processEnv);
+  if (allowlist && !allowlist.has(input.pluginId)) {
+    ENV_CREDENTIAL_LOGGER.warn(
+      { pluginId: input.pluginId },
+      "withheld provider credentials from plugin: not in PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST",
+    );
+    return env;
+  }
+
+  const injected: string[] = [];
   for (const key of [...ADAPTER_ENV_PASSTHROUGH, ...K8S_IN_CLUSTER_ENV_PASSTHROUGH]) {
     const value = processEnv[key];
     if (value && value.trim().length > 0) {
       env[key] = value;
+      injected.push(key);
+    }
+  }
+  if (injected.length > 0) {
+    // Audit which credentials went to which plugin (names only, never values).
+    ENV_CREDENTIAL_LOGGER.info(
+      { pluginId: input.pluginId, credentials: injected, allowlisted: allowlist !== null },
+      "injected provider credentials into plugin worker",
+    );
+    if (allowlist === null) {
+      ENV_CREDENTIAL_LOGGER.warn(
+        { pluginId: input.pluginId },
+        "provider credentials injected without an allowlist; set PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST to restrict which plugins receive them",
+      );
     }
   }
   return env;
@@ -1876,7 +1926,7 @@ export function pluginLoader(
         databaseNamespace,
         hostHandlers,
         autoRestart: true,
-        env: buildPluginWorkerEnv({ manifest, instanceInfo }),
+        env: buildPluginWorkerEnv({ pluginId, manifest, instanceInfo }),
       };
 
       // Repo-local plugin installs can resolve workspace TS sources at runtime

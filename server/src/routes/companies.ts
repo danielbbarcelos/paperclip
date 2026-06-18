@@ -18,6 +18,7 @@ import {
 } from "@paperclipai/shared";
 import { badRequest, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
+import { createDestructiveActionRateLimit } from "../middleware/rate-limit.js";
 import {
   accessService,
   agentService,
@@ -34,6 +35,7 @@ import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
 
 export function companyRoutes(db: Db, storage?: StorageService) {
   const router = Router();
+  const destructiveDeleteLimit = createDestructiveActionRateLimit();
   const svc = companyService(db);
   const agents = agentService(db);
   const portability = companyPortabilityService(db, storage);
@@ -188,7 +190,9 @@ export function companyRoutes(db: Db, storage?: StorageService) {
   router.post("/import/preview", validate(companyPortabilityPreviewSchema), async (req, res) => {
     assertBoard(req);
     assertImportTargetAccess(req, req.body.target);
-    const preview = await portability.previewImport(req.body);
+    const preview = await portability.previewImport(req.body, {
+      allowWorkspaceCommands: req.body.allowWorkspaceCommands === true,
+    });
     res.json(preview);
   });
 
@@ -217,7 +221,9 @@ export function companyRoutes(db: Db, storage?: StorageService) {
         const importBody = companyPortabilityImportSchema.parse(rawImportBody);
         assertImportTargetAccess(req, importBody.target);
         const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
-        const result = await portability.importBundle(importBody, boardUserId);
+        const result = await portability.importBundle(importBody, boardUserId, {
+          allowWorkspaceCommands: importBody.allowWorkspaceCommands === true,
+        });
         await logImportedCompanyActivity(db, activity, result);
         return result;
       };
@@ -231,7 +237,9 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     const importBody = companyPortabilityImportSchema.parse(rawImportBody);
     assertImportTargetAccess(req, importBody.target);
     const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
-    const result = await portability.importBundle(importBody, boardUserId);
+    const result = await portability.importBundle(importBody, boardUserId, {
+      allowWorkspaceCommands: importBody.allowWorkspaceCommands === true,
+    });
     await logImportedCompanyActivity(db, activity, result);
     res.json(result);
   });
@@ -456,11 +464,11 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     res.json(company);
   });
 
-  router.delete("/:companyId", async (req, res) => {
+  router.delete("/:companyId", destructiveDeleteLimit, async (req, res) => {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const company = await svc.remove(companyId);
+    const company = await svc.remove(companyId, getActorInfo(req));
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;

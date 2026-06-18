@@ -65,6 +65,7 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
+import { createDestructiveActionRateLimit } from "../middleware/rate-limit.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -1018,6 +1019,7 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
+  const destructiveDeleteLimit = createDestructiveActionRateLimit();
   const svc = issueService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -5802,7 +5804,7 @@ export function issueRoutes(
     res.json({ ...issueResponse, comment });
   });
 
-  router.delete("/issues/:id", async (req, res) => {
+  router.delete("/issues/:id", destructiveDeleteLimit, async (req, res) => {
     const id = req.params.id as string;
     const existing = await svc.getById(id);
     if (!existing) {
@@ -5811,33 +5813,16 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
 
-    const issue = await svc.remove(id);
+    // Soft delete: the service marks the issue deleted and writes the audit
+    // entry. Attachment object storage is intentionally NOT cleaned here — the
+    // delete is recoverable during the grace window, and the purge job handles
+    // storage teardown when it runs the irreversible cascade.
+    const issue = await svc.remove(id, getActorInfo(req));
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-
-    for (const attachment of attachments) {
-      try {
-        await storage.deleteObject(attachment.companyId, attachment.objectKey);
-      } catch (err) {
-        logger.warn({ err, issueId: id, attachmentId: attachment.id }, "failed to delete attachment object during issue delete");
-      }
-    }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.deleted",
-      entityType: "issue",
-      entityId: issue.id,
-    });
 
     res.json(issue);
   });

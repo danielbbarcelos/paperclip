@@ -146,22 +146,26 @@ function resolveSkillConflictStrategy(mode: ImportMode, collisionStrategy: Compa
   return collisionStrategy === "skip" ? "skip" as const : "rename" as const;
 }
 
-function collectAgentSafeImportPolicyErrors(
+// Fields that carry shell commands eventually executed by workspace-runtime
+// (`spawn(shell, ["-c", command])`). Importing these from an untrusted package
+// is remote code execution, so they are gated independently of the merge mode.
+function collectWorkspaceCommandImportErrors(
   manifest: CompanyPortabilityManifest,
   include: CompanyPortabilityInclude,
+  label: string,
 ) {
   const errors: string[] = [];
   if (include.projects) {
     for (const project of manifest.projects) {
       if (project.executionWorkspacePolicy !== null) {
-        errors.push(`Safe import does not allow project ${project.slug} executionWorkspacePolicy.`);
+        errors.push(`${label} does not allow project ${project.slug} executionWorkspacePolicy.`);
       }
       for (const workspace of project.workspaces) {
         if (workspace.setupCommand) {
-          errors.push(`Safe import does not allow project ${project.slug} workspace ${workspace.key} setupCommand.`);
+          errors.push(`${label} does not allow project ${project.slug} workspace ${workspace.key} setupCommand.`);
         }
         if (workspace.cleanupCommand) {
-          errors.push(`Safe import does not allow project ${project.slug} workspace ${workspace.key} cleanupCommand.`);
+          errors.push(`${label} does not allow project ${project.slug} workspace ${workspace.key} cleanupCommand.`);
         }
       }
     }
@@ -169,8 +173,20 @@ function collectAgentSafeImportPolicyErrors(
   if (include.issues) {
     for (const issue of manifest.issues) {
       if (issue.executionWorkspaceSettings !== null) {
-        errors.push(`Safe import does not allow task ${issue.slug} executionWorkspaceSettings.`);
+        errors.push(`${label} does not allow task ${issue.slug} executionWorkspaceSettings.`);
       }
+    }
+  }
+  return errors;
+}
+
+function collectAgentSafeImportPolicyErrors(
+  manifest: CompanyPortabilityManifest,
+  include: CompanyPortabilityInclude,
+) {
+  const errors: string[] = collectWorkspaceCommandImportErrors(manifest, include, "Safe import");
+  if (include.issues) {
+    for (const issue of manifest.issues) {
       if (issue.assigneeAdapterOverrides !== null) {
         errors.push(`Safe import does not allow task ${issue.slug} assigneeAdapterOverrides.`);
       }
@@ -636,6 +652,12 @@ type ImportMode = "board_full" | "agent_safe";
 type ImportBehaviorOptions = {
   mode?: ImportMode;
   sourceCompanyId?: string | null;
+  // board_full imports plant setup/cleanup commands that are later run through a
+  // shell (workspace-runtime). For an untrusted package that is remote code
+  // execution, so the command-bearing fields are rejected unless the caller
+  // explicitly opts in by trusting the package source. Defaults to false;
+  // agent_safe ignores it (it always rejects those fields).
+  allowWorkspaceCommands?: boolean;
 };
 
 type AgentLike = {
@@ -3904,6 +3926,17 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     }
     if (mode === "agent_safe") {
       errors.push(...collectAgentSafeImportPolicyErrors(manifest, include));
+    } else if (!options?.allowWorkspaceCommands) {
+      // board_full still executes setup/cleanup commands via a shell, so an
+      // untrusted package must not be able to plant them silently. The caller
+      // opts in (allowWorkspaceCommands) only after vouching for the source.
+      errors.push(
+        ...collectWorkspaceCommandImportErrors(
+          manifest,
+          include,
+          "Import without allowWorkspaceCommands",
+        ),
+      );
     }
 
     const selectedSlugs = include.agents

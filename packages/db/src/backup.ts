@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { formatDatabaseBackupResult, runDatabaseBackup } from "./backup-lib.js";
+import { decodeBackupKey } from "./backup-encryption.js";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -71,9 +72,24 @@ async function main() {
   const backupDir = resolveBackupDir(config);
   const retentionDays = resolveRetentionDays(config);
 
+  const encryptionEnabled = process.env.PAPERCLIP_DB_BACKUP_ENCRYPTED === "true";
+  let encryptionKey: Buffer | undefined;
+  if (encryptionEnabled) {
+    const key = decodeBackupKey(process.env.PAPERCLIP_DB_BACKUP_KEY);
+    if (!key) {
+      console.error(
+        "PAPERCLIP_DB_BACKUP_ENCRYPTED=true requires a valid PAPERCLIP_DB_BACKUP_KEY " +
+          "(32-byte base64/hex/raw). Generate one with `openssl rand -base64 32`.",
+      );
+      process.exit(1);
+    }
+    encryptionKey = key;
+  }
+
   console.log(`Config path: ${configPath}`);
   console.log(`Backing up database to: ${backupDir}`);
   console.log(`Retention window: ${retentionDays} day(s)`);
+  console.log(`Encryption: ${encryptionKey ? "on (AES-256-GCM)" : "off"}`);
 
   try {
     const result = await runDatabaseBackup({
@@ -81,6 +97,7 @@ async function main() {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix: "paperclip",
+      encryptionKey,
     });
 
     console.log(`Backup saved: ${formatDatabaseBackupResult(result)}`);

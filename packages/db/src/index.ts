@@ -27,6 +27,11 @@ export {
   type RunDatabaseRestoreOptions,
 } from "./backup-lib.js";
 export {
+  decodeBackupKey,
+  isEncryptedBackupFile,
+  ENCRYPTED_BACKUP_EXTENSION,
+} from "./backup-encryption.js";
+export {
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";

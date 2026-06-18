@@ -33,6 +33,7 @@ import { notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -199,6 +200,52 @@ export function companyService(db: Db) {
       .leftJoin(companyLogos, eq(companyLogos.companyId, companies.id));
   }
 
+  async function hardRemoveCompany(id: string) {
+    return db.transaction(async (tx) => {
+      const companyRunIds = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, id));
+
+      await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
+      if (companyRunIds.length > 0) {
+        await tx
+          .delete(heartbeatRunEvents)
+          .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
+      }
+      await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
+      await tx.delete(activityLog).where(eq(activityLog.companyId, id));
+      await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
+      await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
+      await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
+      await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
+      await tx.delete(issueComments).where(eq(issueComments.companyId, id));
+      await tx.delete(costEvents).where(eq(costEvents.companyId, id));
+      await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
+      await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
+      await tx.delete(approvals).where(eq(approvals.companyId, id));
+      await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
+      await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
+      await tx.delete(invites).where(eq(invites.companyId, id));
+      await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
+      await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
+      await tx.delete(companySkills).where(eq(companySkills.companyId, id));
+      await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
+      await tx.delete(documents).where(eq(documents.companyId, id));
+      await tx.delete(issues).where(eq(issues.companyId, id));
+      await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
+      await tx.delete(assets).where(eq(assets.companyId, id));
+      await tx.delete(goals).where(eq(goals.companyId, id));
+      await tx.delete(projects).where(eq(projects.companyId, id));
+      await tx.delete(agents).where(eq(agents.companyId, id));
+      const rows = await tx
+        .delete(companies)
+        .where(eq(companies.id, id))
+        .returning();
+      return rows[0] ?? null;
+    });
+  }
+
   function deriveIssuePrefixBase(name: string) {
     const normalized = name.toUpperCase().replace(/[^A-Z]/g, "");
     return normalized.slice(0, 3) || ISSUE_PREFIX_FALLBACK;
@@ -245,14 +292,14 @@ export function companyService(db: Db) {
 
   return {
     list: async () => {
-      const rows = await getCompanyQuery(db);
+      const rows = await getCompanyQuery(db).where(isNull(companies.deletedAt));
       const hydrated = await hydrateCompanySpend(rows);
       return hydrated.map((row) => enrichCompany(row));
     },
 
     getById: async (id: string) => {
       const row = await getCompanyQuery(db)
-        .where(eq(companies.id, id))
+        .where(and(eq(companies.id, id), isNull(companies.deletedAt)))
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
       const [hydrated] = await hydrateCompanySpend([row], db);
@@ -421,51 +468,69 @@ export function companyService(db: Db) {
       return result.company;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
-        // Delete from child tables in dependency order
-        const companyRunIds = await tx
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.companyId, id));
+    // Soft delete: mark the company deleted (and inactive) and write an audit
+    // entry, but defer the irreversible cascade to the grace-period purge job
+    // (purgeDeleted). Returns null if the company does not exist or is already
+    // deleted. The actor is recorded for the audit trail.
+    remove: async (id: string, actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR) => {
+      const now = new Date();
+      const deletedByType = actor.actorType === "agent" ? "agent" : actor.actorType === "user" ? "user" : null;
+      const rows = await db
+        .update(companies)
+        .set({
+          deletedAt: now,
+          deletedByType,
+          deletedByAgentId: actor.agentId ?? null,
+          deletedByUserId: actor.actorType === "user" ? actor.actorId : null,
+          deletedByRunId: actor.runId ?? null,
+          status: "deleted",
+          updatedAt: now,
+        })
+        .where(and(eq(companies.id, id), isNull(companies.deletedAt)))
+        .returning();
+      const removed = rows[0] ?? null;
+      if (!removed) return null;
+      // In-app audit (visible during the grace window) plus a durable log line
+      // that survives the eventual purge of the company's own activity log.
+      await logActivity(db, {
+        companyId: id,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId ?? null,
+        runId: actor.runId ?? null,
+        action: "company.deleted",
+        entityType: "company",
+        entityId: id,
+        details: { name: removed.name, softDeletedAt: now.toISOString() },
+      });
+      logger.warn(
+        { companyId: id, companyName: removed.name, actorType: actor.actorType, actorId: actor.actorId },
+        "company soft-deleted (pending purge)",
+      );
+      return removed;
+    },
 
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
-        if (companyRunIds.length > 0) {
-          await tx
-            .delete(heartbeatRunEvents)
-            .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
+    // Irreversible cascade, run by the grace-period purge job once a company has
+    // been soft-deleted long enough.
+    hardRemove: (id: string) => hardRemoveCompany(id),
+
+    // Hard-delete companies soft-deleted before `cutoff`. Returns the count.
+    async purgeDeleted(cutoff: Date) {
+      const due = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(and(eq(companies.status, "deleted"), lt(companies.deletedAt, cutoff)));
+      let purged = 0;
+      for (const { id } of due) {
+        try {
+          await hardRemoveCompany(id);
+          purged += 1;
+        } catch (err) {
+          logger.error({ err, companyId: id }, "company purge failed");
         }
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(companySkills).where(eq(companySkills.companyId, id));
-        await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
-        await tx.delete(documents).where(eq(documents.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-        await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
-        await tx.delete(assets).where(eq(assets.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
-        const rows = await tx
-          .delete(companies)
-          .where(eq(companies.id, id))
-          .returning();
-        return rows[0] ?? null;
-      }),
+      }
+      return purged;
+    },
 
     stats: () =>
       Promise.all([
@@ -476,6 +541,7 @@ export function companyService(db: Db) {
         db
           .select({ companyId: issues.companyId, count: count() })
           .from(issues)
+          .where(isNull(issues.deletedAt))
           .groupBy(issues.companyId),
       ]).then(([agentRows, issueRows]) => {
         const result: Record<string, { agentCount: number; issueCount: number }> = {};

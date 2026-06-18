@@ -4,8 +4,15 @@ import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
+import {
+  ENCRYPTED_BACKUP_EXTENSION,
+  createBackupDecryptStream,
+  createBackupEncryptStream,
+  isEncryptedBackupFile,
+} from "./backup-encryption.js";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -28,6 +35,13 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * When set, the backup is encrypted with streaming AES-256-GCM and the output
+   * file gains a trailing ".enc". The key must live OUTSIDE the backup volume
+   * (e.g. injected via PAPERCLIP_DB_BACKUP_KEY) so a compromise of the backup
+   * directory does not also yield the plaintext database.
+   */
+  encryptionKey?: Buffer;
 };
 
 export type RunDatabaseBackupResult = {
@@ -40,6 +54,11 @@ export type RunDatabaseRestoreOptions = {
   connectionString: string;
   backupFile: string;
   connectTimeoutSeconds?: number;
+  /**
+   * Required to restore an encrypted (".enc") backup. Must be the same key used
+   * to create it; restoring an encrypted file without it fails fast.
+   */
+  encryptionKey?: Buffer;
 };
 
 type SequenceDefinition = {
@@ -127,7 +146,9 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
 
   for (const name of readdirSync(backupDir)) {
     if (!name.startsWith(`${filenamePrefix}-`)) continue;
-    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz") && !name.endsWith(`.sql.gz${ENCRYPTED_BACKUP_EXTENSION}`)) {
+      continue;
+    }
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
     entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
@@ -315,6 +336,7 @@ async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  encryptionKey?: Buffer;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const child = spawn(
@@ -340,10 +362,41 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
+  const transforms: NodeJS.ReadWriteStream[] = [createGzip()];
+  if (opts.encryptionKey) transforms.push(createBackupEncryptStream(opts.encryptionKey));
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline([child.stdout, ...transforms, createWriteStream(opts.backupFile)]),
     waitForChildExit(child, pgDumpBin),
   ]);
+}
+
+/**
+ * Open a backup file as a plaintext SQL stream, transparently undoing the
+ * on-disk transforms in order: decrypt (.enc) then decompress (.gz). Returns the
+ * underlying file handle separately so callers can tear both down.
+ */
+function openBackupForRead(
+  backupFile: string,
+  encryptionKey?: Buffer,
+): { raw: Readable; stream: Readable } {
+  const raw = createReadStream(backupFile);
+  let stream: Readable = raw;
+  let name = backupFile;
+  if (isEncryptedBackupFile(name)) {
+    if (!encryptionKey) {
+      raw.destroy();
+      throw new Error(
+        `Backup ${basename(backupFile)} is encrypted but no decryption key was provided ` +
+          "(set PAPERCLIP_DB_BACKUP_KEY to the key used to create it).",
+      );
+    }
+    stream = stream.pipe(createBackupDecryptStream(encryptionKey));
+    name = name.slice(0, -ENCRYPTED_BACKUP_EXTENSION.length);
+  }
+  if (name.endsWith(".gz")) {
+    stream = stream.pipe(createGunzip());
+  }
+  return { raw, stream };
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -369,9 +422,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
     throw new Error("psql did not expose stdin");
   }
 
-  const input = opts.backupFile.endsWith(".gz")
-    ? createReadStream(opts.backupFile).pipe(createGunzip())
-    : createReadStream(opts.backupFile);
+  const { stream: input } = openBackupForRead(opts.backupFile, opts.encryptionKey);
 
   await Promise.all([
     pipeline(input, child.stdin),
@@ -379,9 +430,8 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
   ]);
 }
 
-async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
-  const raw = createReadStream(backupFile);
-  const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
+async function hasStatementBreakpoints(backupFile: string, encryptionKey?: Buffer): Promise<boolean> {
+  const { raw, stream } = openBackupForRead(backupFile, encryptionKey);
   let text = "";
 
   try {
@@ -397,9 +447,8 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   }
 }
 
-async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
-  const raw = createReadStream(backupFile);
-  const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
+async function* readRestoreStatements(backupFile: string, encryptionKey?: Buffer): AsyncGenerator<string> {
+  const { raw, stream } = openBackupForRead(backupFile, encryptionKey);
   stream.setEncoding("utf8");
   const reader = createInterface({
     input: stream,
@@ -535,7 +584,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   };
   mkdirSync(opts.backupDir, { recursive: true });
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupFile = `${sqlFile}.gz${opts.encryptionKey ? ENCRYPTED_BACKUP_EXTENSION : ""}`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -547,6 +596,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectionString: opts.connectionString,
           backupFile,
           connectTimeout,
+          encryptionKey: opts.encryptionKey,
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
@@ -955,10 +1005,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
+    // Compress the SQL file with gzip, then optionally encrypt to .gz.enc.
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    const writeTransforms: NodeJS.ReadWriteStream[] = [createGzip()];
+    if (opts.encryptionKey) writeTransforms.push(createBackupEncryptStream(opts.encryptionKey));
+    await pipeline([sqlReadStream, ...writeTransforms, createWriteStream(backupFile)]);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
@@ -989,7 +1040,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     await restoreWithPsql(opts, connectTimeout);
     return;
   } catch (error) {
-    if (!(await hasStatementBreakpoints(opts.backupFile))) {
+    if (!(await hasStatementBreakpoints(opts.backupFile, opts.encryptionKey))) {
       throw new Error(
         `Failed to restore ${basename(opts.backupFile)} with psql: ${sanitizeRestoreErrorMessage(error)}`,
       );
@@ -1000,7 +1051,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
-    for await (const statement of readRestoreStatements(opts.backupFile)) {
+    for await (const statement of readRestoreStatements(opts.backupFile, opts.encryptionKey)) {
       await sql.unsafe(statement).execute();
     }
   } catch (error) {

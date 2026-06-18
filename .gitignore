@@ -60,3 +60,9 @@ tests/release-smoke/playwright-report/
 .superpowers/
 .claude/worktrees/
 .herenow
+
+# provision_ubuntu.py — artefatos gerados
+docker/docker-compose.deploy.yml
+deploy/logs/
+__pycache__/
+*.pyc

@@ -31,6 +31,7 @@ import {
 import { badRequest, conflict, HttpError, notFound } from "../errors.js";
 import { companyPortabilityService } from "./company-portability.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
+import { assertPublicHttpUrl } from "../adapters/http/url-guard.js";
 
 const DEFAULT_SCOPES = ["upstream_import:preview", "upstream_import:write", "upstream_import:read"];
 const TRANSFER_SCHEMA = {
@@ -156,6 +157,9 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
 
       const discovery = await fetchDiscovery(remoteUrl);
       const target = targetFromDiscovery(discovery);
+      // The discovery response controls `origin`, which becomes targetOrigin for
+      // every later outbound call — validate it before we persist/connect.
+      await assertAllowedUpstreamUrl(target.origin);
       const connectionId = crypto.randomUUID();
       const state = crypto.randomBytes(24).toString("base64url");
       const codeVerifier = crypto.randomBytes(32).toString("base64url");
@@ -645,6 +649,39 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
   }
 }
 
+/**
+ * SSRF guard for cloud-upstream targets. The discovery URL and the origin it
+ * returns are attacker-influenced (a company member supplies the remote URL,
+ * and the remote response dictates `origin`/`targetOrigin`). Without this, the
+ * server would happily fetch internal services or the cloud metadata endpoint.
+ *
+ * Reuses assertPublicHttpUrl (rejects private/reserved IPs by literal and by
+ * DNS across all records). The explicit localhost/127.0.0.1 dev escape hatch —
+ * already permitted by the HTTPS exception below — is preserved so local
+ * development against a loopback cloud stack keeps working.
+ */
+export async function assertAllowedUpstreamUrl(urlString: string): Promise<void> {
+  let hostname: string;
+  try {
+    hostname = new URL(urlString).hostname;
+  } catch {
+    throw badRequest(`Invalid cloud upstream URL: ${urlString}`);
+  }
+  if (hostname === "localhost" || hostname === "127.0.0.1") return;
+  try {
+    await assertPublicHttpUrl(urlString);
+  } catch (err) {
+    const message = (err as Error).message;
+    // A host that fails to resolve is not a private-IP SSRF vector — the real
+    // fetch would fail to connect anyway. Only block on the meaningful signals:
+    // a private/reserved target, a disallowed protocol, or a malformed URL.
+    if (/DNS resolution (failed|returned no results)/i.test(message)) {
+      return;
+    }
+    throw badRequest(`Refusing to connect to cloud upstream: ${message}`);
+  }
+}
+
 async function fetchDiscovery(remoteUrl: string): Promise<Record<string, unknown>> {
   const parsed = new URL(remoteUrl);
   if (parsed.protocol !== "https:" && parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1") {
@@ -655,6 +692,7 @@ async function fetchDiscovery(remoteUrl: string): Promise<Record<string, unknown
   if (stackId) {
     discoveryUrl.searchParams.set("stackId", stackId);
   }
+  await assertAllowedUpstreamUrl(discoveryUrl.toString());
   const response = await fetchWithTimeout(discoveryUrl, undefined, DISCOVERY_FETCH_TIMEOUT_MS);
   if (!response.ok) {
     throw badRequest(`Cloud upstream discovery failed: ${response.status}`);
@@ -968,6 +1006,7 @@ function buildLocalChunks(entities: LocalUpstreamExportEntity[], maxEntitiesPerC
 }
 
 async function remoteGet(connection: ConnectionRow, path: string): Promise<unknown> {
+  await assertAllowedUpstreamUrl(`${connection.targetOrigin}${path}`);
   const response = await fetchWithTimeout(`${connection.targetOrigin}${path}`, {
     method: "GET",
     headers: await proofHeaders(connection, "GET", path),
@@ -976,6 +1015,7 @@ async function remoteGet(connection: ConnectionRow, path: string): Promise<unkno
 }
 
 async function remotePost(connection: ConnectionRow, path: string, body: unknown): Promise<unknown> {
+  await assertAllowedUpstreamUrl(`${connection.targetOrigin}${path}`);
   const response = await fetchWithTimeout(`${connection.targetOrigin}${path}`, {
     method: "POST",
     headers: {

@@ -245,6 +245,10 @@ export const companyPortabilityPreviewSchema = z.object({
   collisionStrategy: portabilityCollisionStrategySchema.optional(),
   nameOverrides: z.record(z.string().min(1), z.string().min(1)).optional(),
   selectedFiles: z.array(z.string().min(1)).optional(),
+  // Explicit operator acknowledgement that the imported package may carry setup/
+  // cleanup commands which are executed through a shell. Defaults to false so an
+  // untrusted bundle cannot silently plant commands (board_full import RCE).
+  allowWorkspaceCommands: z.boolean().optional(),
 });
 
 export type CompanyPortabilityPreview = z.infer<typeof companyPortabilityPreviewSchema>;

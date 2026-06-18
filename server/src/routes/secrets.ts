@@ -11,12 +11,14 @@ import {
   updateSecretSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { createDestructiveActionRateLimit } from "../middleware/rate-limit.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 
 export function secretRoutes(db: Db) {
   const router = Router();
+  const destructiveDeleteLimit = createDestructiveActionRateLimit();
   const svc = secretService(db);
   const defaultProvider = getConfiguredSecretProvider();
 
@@ -481,7 +483,7 @@ export function secretRoutes(db: Db) {
     res.json(events);
   });
 
-  router.delete("/secrets/:id", async (req, res) => {
+  router.delete("/secrets/:id", destructiveDeleteLimit, async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     const existing = await svc.getById(id);

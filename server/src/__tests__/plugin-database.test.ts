@@ -150,6 +150,7 @@ describe("buildPluginWorkerEnv", () => {
 
   it("passes only model provider keys through to environment driver plugins", () => {
     const env = buildPluginWorkerEnv({
+      pluginId: "test.plugin",
       manifest: { capabilities: ["environment.drivers.register"] },
       instanceInfo,
       processEnv: {
@@ -170,6 +171,7 @@ describe("buildPluginWorkerEnv", () => {
 
   it("passes in-cluster Kubernetes service-discovery vars to environment driver plugins", () => {
     const env = buildPluginWorkerEnv({
+      pluginId: "test.plugin",
       manifest: { capabilities: ["environment.drivers.register"] },
       instanceInfo,
       processEnv: {
@@ -190,10 +192,63 @@ describe("buildPluginWorkerEnv", () => {
 
   it("does not pass provider keys to non-environment plugins", () => {
     const env = buildPluginWorkerEnv({
+      pluginId: "test.plugin",
       manifest: { capabilities: ["ui.slots.register"] },
       instanceInfo,
       processEnv: {
         OPENAI_API_KEY: "openai-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
+  it("withholds provider keys from an environment plugin not on the allowlist", () => {
+    const env = buildPluginWorkerEnv({
+      pluginId: "untrusted.plugin",
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo,
+      processEnv: {
+        PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST: "trusted.plugin,other.plugin",
+        ANTHROPIC_API_KEY: "anthropic-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
+  it("passes provider keys to an allowlisted environment plugin", () => {
+    const env = buildPluginWorkerEnv({
+      pluginId: "trusted.plugin",
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo,
+      processEnv: {
+        PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST: "trusted.plugin,other.plugin",
+        ANTHROPIC_API_KEY: "anthropic-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      ANTHROPIC_API_KEY: "anthropic-token",
+    });
+  });
+
+  it("denies all when the allowlist is set but empty", () => {
+    const env = buildPluginWorkerEnv({
+      pluginId: "trusted.plugin",
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo,
+      processEnv: {
+        PAPERCLIP_PLUGIN_CREDENTIAL_ALLOWLIST: "",
+        ANTHROPIC_API_KEY: "anthropic-token",
       },
     });
 

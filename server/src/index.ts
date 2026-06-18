@@ -52,6 +52,7 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
+import { startSoftDeletePurgeTimer } from "./services/soft-delete-purge.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
@@ -509,6 +510,36 @@ export async function startServer(): Promise<StartedServer> {
       if (!config.authPublicBaseUrl) {
         throw new Error("authenticated public exposure requires auth.publicBaseUrl");
       }
+      // Cloud tenant trust-header auth lets an upstream proxy mint identities
+      // via a shared token. Over the open internet that token alone is a
+      // cross-tenant impersonation primitive, so a public deployment that
+      // enables it MUST also configure the HMAC signing key (and the runtime
+      // then treats the signature as mandatory — see verifyCloudTenantSignature).
+      if (
+        process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim() &&
+        !process.env.PAPERCLIP_CLOUD_TENANT_HMAC_KEY?.trim()
+      ) {
+        throw new Error(
+          "authenticated public exposure with PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN set " +
+            "also requires PAPERCLIP_CLOUD_TENANT_HMAC_KEY so the upstream proxy can sign " +
+            "tenant identity headers (prevents cross-tenant impersonation from a leaked token).",
+        );
+      }
+      // req.ip (and thus per-client rate limiting / brute-force throttles) is
+      // only correct behind a known proxy when TRUST_PROXY is set. Behind a
+      // reverse proxy with TRUST_PROXY unset, every client is bucketed under the
+      // proxy IP and the auth throttles fail open. Force an explicit decision:
+      // a hop count / trusted subnet when proxied, or "0"/"false" to declare a
+      // direct (no-proxy) public deployment where req.ip is already correct.
+      const trustProxyRaw = process.env.TRUST_PROXY?.trim();
+      if (trustProxyRaw === undefined || trustProxyRaw === "") {
+        throw new Error(
+          "authenticated public exposure requires an explicit TRUST_PROXY: set it to your " +
+            "reverse proxy's hop count (e.g. 1) or trusted subnet(s) when proxied, or to 0 " +
+            "if Paperclip is exposed directly without a proxy. Leaving it unset makes " +
+            "per-client rate limiting ineffective behind a proxy.",
+        );
+      }
     }
   }
 
@@ -608,6 +639,7 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        encryptionKey: config.databaseBackupEncryptionKey,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -912,7 +944,15 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  // Permanently purge companies/issues that were soft-deleted longer than the
+  // grace window ago. Soft delete keeps them recoverable until this runs.
+  logger.info(
+    { graceDays: config.softDeleteGraceDays },
+    "Soft-delete purge sweep enabled",
+  );
+  startSoftDeletePurgeTimer(db as any, storageService, config.softDeleteGraceDays);
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.

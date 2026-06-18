@@ -99,4 +99,31 @@ describe("verifyCloudTenantSignature", () => {
     });
     expect(verifyCloudTenantSignature(req, IDENTITY)).toBe("invalid");
   });
+
+  describe("public exposure (signature mandatory regardless of the REQUIRED flag)", () => {
+    it("rejects an unsigned request even when not flagged required", () => {
+      process.env[KEY_ENV] = "secret-key";
+      expect(
+        verifyCloudTenantSignature(reqWith({}), IDENTITY, { deploymentExposure: "public" }),
+      ).toBe("invalid");
+    });
+
+    it("rejects when no signing key is configured (no insecure fallback)", () => {
+      expect(
+        verifyCloudTenantSignature(reqWith({}), IDENTITY, { deploymentExposure: "public" }),
+      ).toBe("invalid");
+    });
+
+    it("still accepts a correctly signed, fresh request", () => {
+      process.env[KEY_ENV] = "secret-key";
+      const ts = Math.floor(Date.now() / 1000);
+      const req = reqWith({
+        "x-paperclip-cloud-timestamp": String(ts),
+        "x-paperclip-cloud-signature": sign("secret-key", ts),
+      });
+      expect(verifyCloudTenantSignature(req, IDENTITY, { deploymentExposure: "public" })).toBe(
+        "valid",
+      );
+    });
+  });
 });

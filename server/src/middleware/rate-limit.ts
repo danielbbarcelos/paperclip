@@ -65,6 +65,32 @@ export type RateLimitMiddlewareOptions = {
   now?: () => number;
 };
 
+/** Stable per-actor bucket key: a user, an agent, or (unauthenticated) the IP. */
+export function actorRateLimitKey(req: Request): string {
+  const actor = req.actor;
+  if (actor?.userId) return `user:${actor.userId}`;
+  if (actor?.agentId) return `agent:${actor.agentId}`;
+  return `ip:${req.ip ?? "unknown"}`;
+}
+
+/**
+ * Aggressive per-actor throttle for irreversible cascade deletes (companies,
+ * issues, secrets). These wipe many rows in one transaction, so a runaway script
+ * or a compromised session could destroy a workspace in seconds; bounding the
+ * rate buys time to notice. Generous enough for normal interactive use.
+ */
+export function createDestructiveActionRateLimit(options?: {
+  windowMs?: number;
+  maxRequests?: number;
+}): RequestHandler {
+  return rateLimitMiddleware({
+    windowMs: options?.windowMs ?? (Number(process.env.PAPERCLIP_DESTRUCTIVE_RATELIMIT_WINDOW_MS) || 60_000),
+    maxRequests: options?.maxRequests ?? (Number(process.env.PAPERCLIP_DESTRUCTIVE_RATELIMIT_MAX) || 20),
+    keyFn: (req) => `destroy:${actorRateLimitKey(req)}`,
+    message: "Too many destructive delete operations; slow down.",
+  });
+}
+
 export function rateLimitMiddleware(options: RateLimitMiddlewareOptions): RequestHandler {
   const limiter = createRateLimiter({
     windowMs: options.windowMs,

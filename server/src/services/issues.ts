@@ -59,6 +59,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
@@ -1962,6 +1963,11 @@ const issueListSelect = {
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
   hiddenAt: issues.hiddenAt,
+  deletedAt: issues.deletedAt,
+  deletedByType: issues.deletedByType,
+  deletedByAgentId: issues.deletedByAgentId,
+  deletedByUserId: issues.deletedByUserId,
+  deletedByRunId: issues.deletedByRunId,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
 };
@@ -3116,6 +3122,13 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+export type IssueDeleteActor = {
+  actorType: "user" | "agent" | "system";
+  actorId: string;
+  agentId?: string | null;
+  runId?: string | null;
+};
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -3124,7 +3137,7 @@ export function issueService(db: Db) {
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.id, id))
+      .where(and(eq(issues.id, id), isNull(issues.deletedAt)))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
@@ -3135,7 +3148,7 @@ export function issueService(db: Db) {
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.identifier, identifier.toUpperCase()))
+      .where(and(eq(issues.identifier, identifier.toUpperCase()), isNull(issues.deletedAt)))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
@@ -3940,6 +3953,41 @@ export function issueService(db: Db) {
     });
   }
 
+  async function hardRemoveIssue(id: string) {
+    return db.transaction(async (tx) => {
+      const attachmentAssetIds = await tx
+        .select({ assetId: issueAttachments.assetId })
+        .from(issueAttachments)
+        .where(eq(issueAttachments.issueId, id));
+      const issueDocumentIds = await tx
+        .select({ documentId: issueDocuments.documentId })
+        .from(issueDocuments)
+        .where(eq(issueDocuments.issueId, id));
+
+      const removedIssue = await tx
+        .delete(issues)
+        .where(eq(issues.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (removedIssue && attachmentAssetIds.length > 0) {
+        await tx
+          .delete(assets)
+          .where(inArray(assets.id, attachmentAssetIds.map((row) => row.assetId)));
+      }
+
+      if (removedIssue && issueDocumentIds.length > 0) {
+        await tx
+          .delete(documents)
+          .where(inArray(documents.id, issueDocumentIds.map((row) => row.documentId)));
+      }
+
+      if (!removedIssue) return null;
+      const [enriched] = await withIssueLabels(tx, [removedIssue]);
+      return enriched;
+    });
+  }
+
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
@@ -3953,7 +4001,7 @@ export function issueService(db: Db) {
         });
       }
 
-      const conditions = [eq(issues.companyId, companyId)];
+      const conditions = [eq(issues.companyId, companyId), isNull(issues.deletedAt)];
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(filters?.assigneeAgentId);
       assertValidAssigneeAgentFilter(assigneeAgentFilter);
       const limit = typeof filters?.limit === "number" && Number.isFinite(filters.limit)
@@ -5443,39 +5491,60 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
-        const attachmentAssetIds = await tx
-          .select({ assetId: issueAttachments.assetId })
-          .from(issueAttachments)
-          .where(eq(issueAttachments.issueId, id));
-        const issueDocumentIds = await tx
-          .select({ documentId: issueDocuments.documentId })
-          .from(issueDocuments)
-          .where(eq(issueDocuments.issueId, id));
+    // Soft delete: mark the issue deleted (status -> "cancelled" so active-work
+    // queries already skip it) and write an audit entry. The irreversible
+    // cascade — including attachment assets/documents and object storage — is
+    // deferred to the grace-period purge job so a delete stays recoverable.
+    // Returns null if the issue does not exist or is already deleted.
+    remove: async (id: string, actor?: IssueDeleteActor) => {
+      const now = new Date();
+      const deletedByType = actor?.actorType === "agent" ? "agent" : actor?.actorType === "user" ? "user" : null;
+      const removedIssue = await db
+        .update(issues)
+        .set({
+          deletedAt: now,
+          deletedByType,
+          deletedByAgentId: actor?.agentId ?? null,
+          deletedByUserId: actor?.actorType === "user" ? actor.actorId : null,
+          deletedByRunId: actor?.runId ?? null,
+          status: "cancelled",
+          cancelledAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, id), isNull(issues.deletedAt)))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!removedIssue) return null;
+      await logActivity(db, {
+        companyId: removedIssue.companyId,
+        actorType: actor?.actorType ?? "system",
+        actorId: actor?.actorId ?? "system",
+        agentId: actor?.agentId ?? null,
+        runId: actor?.runId ?? null,
+        action: "issue.deleted",
+        entityType: "issue",
+        entityId: id,
+        details: { identifier: removedIssue.identifier, softDeletedAt: now.toISOString() },
+      });
+      const [enriched] = await withIssueLabels(db, [removedIssue]);
+      return enriched;
+    },
 
-        const removedIssue = await tx
-          .delete(issues)
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+    // Irreversible hard delete (issue row + attachment assets + linked
+    // documents), run by the grace-period purge job. The caller is responsible
+    // for cleaning the attachments' object storage first (it needs the object
+    // keys, which are gone after this returns).
+    hardRemove: (id: string) => hardRemoveIssue(id),
 
-        if (removedIssue && attachmentAssetIds.length > 0) {
-          await tx
-            .delete(assets)
-            .where(inArray(assets.id, attachmentAssetIds.map((row) => row.assetId)));
-        }
-
-        if (removedIssue && issueDocumentIds.length > 0) {
-          await tx
-            .delete(documents)
-            .where(inArray(documents.id, issueDocumentIds.map((row) => row.documentId)));
-        }
-
-        if (!removedIssue) return null;
-        const [enriched] = await withIssueLabels(tx, [removedIssue]);
-        return enriched;
-      }),
+    // Issues soft-deleted before `cutoff`, for the purge job to hard-delete.
+    // lt() over a nullable column is false for NULLs, so this matches only rows
+    // that were actually soft-deleted before the cutoff.
+    async listSoftDeletedBefore(cutoff: Date) {
+      return db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(lt(issues.deletedAt, cutoff));
+    },
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db

@@ -67,6 +67,15 @@ export const issues = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
+    // Soft delete: `remove()` sets these (and status="cancelled") instead of
+    // cascading immediately; a grace-period purge job runs the hard delete.
+    // Audit ids are plain columns (no FK) to survive after the referenced
+    // agent/run rows are themselves purged.
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    deletedByType: text("deleted_by_type").$type<"agent" | "user">(),
+    deletedByAgentId: uuid("deleted_by_agent_id"),
+    deletedByUserId: text("deleted_by_user_id"),
+    deletedByRunId: uuid("deleted_by_run_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

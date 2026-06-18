@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
@@ -173,6 +174,71 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
             metadata: { index: 159, even: false },
           },
         ]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "encrypts the backup at rest and round-trips it with the key (and fails without it)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_encrypted_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-encrypted-backup-");
+      const encryptionKey = randomBytes(32);
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."enc_records" (
+            "id" serial PRIMARY KEY,
+            "secret" text NOT NULL
+          );
+          INSERT INTO "public"."enc_records" ("secret")
+          VALUES ('top-secret-value'), ('another-secret');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-enc-test",
+          backupEngine: "javascript",
+          encryptionKey,
+        });
+
+        // File is encrypted: .enc extension and no plaintext secret on disk.
+        expect(result.backupFile).toMatch(/paperclip-enc-test-.*\.sql\.gz\.enc$/);
+        const rawBytes = fs.readFileSync(result.backupFile);
+        expect(rawBytes.includes(Buffer.from("top-secret-value"))).toBe(false);
+        expect(rawBytes.subarray(0, 8).toString("utf8")).toBe("PCBKENC1");
+
+        // Restoring without the key fails fast.
+        await expect(
+          runDatabaseRestore({
+            connectionString: restoreConnectionString,
+            backupFile: result.backupFile,
+          }),
+        ).rejects.toThrow(/encrypted but no decryption key/i);
+
+        // Restoring with the key reproduces the rows.
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+          encryptionKey,
+        });
+
+        const rows = await restoreSql.unsafe<{ secret: string }[]>(
+          `SELECT "secret" FROM "public"."enc_records" ORDER BY "id"`,
+        );
+        expect(rows.map((r) => r.secret)).toEqual(["top-secret-value", "another-secret"]);
       } finally {
         await sourceSql.end();
         await restoreSql.end();

@@ -4,7 +4,7 @@ import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import type { DeploymentMode } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
@@ -16,6 +16,7 @@ function hashToken(token: string) {
 
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
+  deploymentExposure?: DeploymentExposure;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
 }
 
@@ -39,7 +40,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     const authHeader = req.header("authorization");
     if (!authHeader?.toLowerCase().startsWith("bearer ")) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
-        const cloudTenantActor = await resolveCloudTenantActor(db, req);
+        const cloudTenantActor = await resolveCloudTenantActor(db, req, {
+          deploymentExposure: opts.deploymentExposure,
+        });
         if (cloudTenantActor) {
           req.actor = {
             ...cloudTenantActor,
@@ -200,7 +203,11 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
   };
 }
 
-export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {
+export async function resolveCloudTenantActor(
+  db: Db,
+  req: Request,
+  opts?: { deploymentExposure?: DeploymentExposure },
+): Promise<Express.Request["actor"] | null> {
   const expectedToken = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim();
   if (!expectedToken) return null;
 
@@ -223,7 +230,11 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
   // the upstream proxy must additionally sign userId:stackId:role:timestamp, so
   // a leaked token cannot mint identities without the signing key. Opt-in with
   // fallback so the external proxy can be upgraded independently.
-  if (verifyCloudTenantSignature(req, { userId, stackId, stackRole }) === "invalid") {
+  if (
+    verifyCloudTenantSignature(req, { userId, stackId, stackRole }, {
+      deploymentExposure: opts?.deploymentExposure,
+    }) === "invalid"
+  ) {
     return null;
   }
 
@@ -340,6 +351,14 @@ const CLOUD_TENANT_SIGNATURE_MAX_SKEW_SECONDS = 300;
  *  - "valid"   — signature present and verified within the freshness window.
  *  - "invalid" — signature present but wrong/expired, or required-but-missing.
  *
+ * Under public exposure the signature is mandatory regardless of the
+ * PAPERCLIP_CLOUD_TENANT_HMAC_REQUIRED flag: an unsigned request, or a missing
+ * signing key, would let a leaked shared tenant token forge identities across
+ * tenants over the open internet, so both collapse to "invalid". The boot check
+ * (server/src/index.ts) refuses to start a public deployment that has the
+ * tenant token set without a signing key, so reaching the keyless branch here
+ * is defense-in-depth.
+ *
  * Signed payload: `${userId}:${stackId}:${stackRole}:${timestamp}` where
  * timestamp is unix seconds, carried in x-paperclip-cloud-timestamp, and the
  * base64url HMAC-SHA256 is carried in x-paperclip-cloud-signature.
@@ -347,11 +366,22 @@ const CLOUD_TENANT_SIGNATURE_MAX_SKEW_SECONDS = 300;
 export function verifyCloudTenantSignature(
   req: Request,
   identity: { userId: string; stackId: string; stackRole: string },
+  opts?: { deploymentExposure?: DeploymentExposure },
 ): "skip" | "valid" | "invalid" {
+  const isPublic = opts?.deploymentExposure === "public";
   const key = process.env.PAPERCLIP_CLOUD_TENANT_HMAC_KEY?.trim();
-  if (!key) return "skip";
+  if (!key) {
+    if (isPublic) {
+      logger.warn(
+        { stackId: identity.stackId },
+        "cloud tenant request rejected: HMAC signing key is required under public exposure",
+      );
+      return "invalid";
+    }
+    return "skip";
+  }
 
-  const required = parseBooleanEnvValue(process.env.PAPERCLIP_CLOUD_TENANT_HMAC_REQUIRED);
+  const required = isPublic || parseBooleanEnvValue(process.env.PAPERCLIP_CLOUD_TENANT_HMAC_REQUIRED);
   const signature = req.header("x-paperclip-cloud-signature")?.trim();
   const timestamp = req.header("x-paperclip-cloud-timestamp")?.trim();
 

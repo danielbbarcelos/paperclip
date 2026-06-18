@@ -220,7 +220,9 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       createdByRunId: runId,
     });
 
-    const removed = await companyService(db).remove(companyId);
+    // hardRemove runs the irreversible cascade (remove() now soft-deletes; the
+    // cascade is deferred to the grace-period purge job which calls hardRemove).
+    const removed = await companyService(db).hardRemove(companyId);
 
     expect(removed?.id).toBe(companyId);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
@@ -251,7 +253,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       message: "event with mismatched company scope",
     });
 
-    const removed = await companyService(db).remove(companyId);
+    const removed = await companyService(db).hardRemove(companyId);
 
     expect(removed?.id).toBe(companyId);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);

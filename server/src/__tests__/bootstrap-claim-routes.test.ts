@@ -3,7 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { accessRoutes } from "../routes/access.js";
-import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
+import { boardMutationGuard, buildTrustedBoardOrigins } from "../middleware/board-mutation-guard.js";
 import { errorHandler } from "../middleware/index.js";
 
 const claimFirstInstanceAdminMock = vi.hoisted(() => vi.fn());
@@ -67,7 +67,15 @@ function createApp(input: {
     next();
   });
   if (input.guardMutations) {
-    app.use(boardMutationGuard());
+    app.use(
+      boardMutationGuard({
+        trustedOrigins: buildTrustedBoardOrigins({
+          allowedHostnames: [],
+          port: 3100,
+          deploymentMode: "local_trusted",
+        }),
+      }),
+    );
   }
   app.use(
     "/api",
@@ -157,8 +165,7 @@ describe("POST /bootstrap/claim", () => {
 
     const allowed = await request(app)
       .post("/api/bootstrap/claim")
-      .set("Host", "paperclip.local")
-      .set("Origin", "http://paperclip.local")
+      .set("Origin", "http://localhost:3100")
       .send({});
     expect(allowed.status).toBe(200);
     expect(claimFirstInstanceAdminMock).toHaveBeenCalledTimes(1);

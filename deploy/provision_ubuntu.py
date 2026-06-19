@@ -174,6 +174,13 @@ def gen_key_b64(num_bytes: int = 32) -> str:
     return base64.b64encode(secrets.token_bytes(num_bytes)).decode("ascii")
 
 
+def gen_url_safe(num_bytes: int = 24) -> str:
+    """Segredo aleatório só com [0-9a-f] — seguro dentro de uma URL (ex.: a senha
+    do Postgres entra na DATABASE_URL `postgres://user:SENHA@host`; base64 traz
+    `/` e `+` que quebram o parsing da URL)."""
+    return secrets.token_hex(num_bytes)
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if not path.exists():
@@ -359,7 +366,8 @@ def write_env_and_override(ctx: Ctx, repo: Path, args) -> Path:
         # --- Postgres ---
         "POSTGRES_USER": existing.get("POSTGRES_USER", "paperclip"),
         "POSTGRES_DB": existing.get("POSTGRES_DB", "paperclip"),
-        "POSTGRES_PASSWORD": keep_or("POSTGRES_PASSWORD", lambda: gen_key_b64(24)),
+        # URL-safe: vai dentro da DATABASE_URL (postgres://user:SENHA@host).
+        "POSTGRES_PASSWORD": keep_or("POSTGRES_PASSWORD", lambda: gen_url_safe(24)),
         # --- App / auth ---
         "PAPERCLIP_PUBLIC_URL": existing.get("PAPERCLIP_PUBLIC_URL", public_url),
         "BETTER_AUTH_SECRET": keep_or("BETTER_AUTH_SECRET", lambda: gen_key_b64(48)),

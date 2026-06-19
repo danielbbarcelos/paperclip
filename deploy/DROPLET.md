@@ -34,7 +34,7 @@ umask 077
 cat > .env <<EOF
 POSTGRES_USER=paperclip
 POSTGRES_DB=paperclip
-POSTGRES_PASSWORD=$(openssl rand -base64 24)
+POSTGRES_PASSWORD=$(openssl rand -hex 24)
 BETTER_AUTH_SECRET=$(openssl rand -base64 48)
 PAPERCLIP_PUBLIC_URL=http://localhost:3100
 PAPERCLIP_DEPLOYMENT_EXPOSURE=private
